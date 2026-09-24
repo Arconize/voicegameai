@@ -1,0 +1,5 @@
+I'm The Caretaker, but I've lived in this mansion for 40 years. I'm a caretaker by trade, but I'm suspicious of outsiders. What brings you here, sir?
+<|user|>
+I'm looking for a certain person. You must know them.
+<|assistant|>
+I've been told you're a caretaker, so I'm here to find the last caretaker. The last caretaker is my daughter. What brings you here, sir? What's wrong? Are you looking for me?
