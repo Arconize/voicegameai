@@ -1,153 +1,199 @@
 #include "persona_manager.h"
-#include <fstream>
+#include "audio_capture.h"
+#include "stt_engine.h"
+#include "llm_engine.h"
+#include "output_writer.h"
+
 #include <iostream>
+#include <fstream>
+#include <sstream>
+#include <thread>
+#include <chrono>
 #include <filesystem>
-#include <algorithm>
+
+#ifdef _WIN32
+  #define WIN32_LEAN_AND_MEAN
+  #define NOMINMAX
+  #include <windows.h>
+#endif
 
 namespace fs = std::filesystem;
 
-// Helper to trim leading/trailing whitespace
-static std::string trim(const std::string& str) {
-    size_t first = str.find_first_not_of(" \t\r\n");
-    if (first == std::string::npos) return "";
-    size_t last = str.find_last_not_of(" \t\r\n");
-    return str.substr(first, (last - first + 1));
+static std::string readFileTrimmed(const std::string& path) {
+    std::ifstream f(path);
+    if (!f.is_open()) return "";
+    std::stringstream ss;
+    ss << f.rdbuf();
+    std::string s = ss.str();
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' '))
+        s.pop_back();
+    return s;
 }
 
-// Helper for case-insensitive prefix checking
-static bool startsWithIgnoreCase(const std::string& str, const std::string& prefix, std::string& out_val) {
-    if (str.size() < prefix.size()) return false;
-    std::string str_sub = str.substr(0, prefix.size());
-    std::string lower_str = str_sub;
-    std::string lower_prefix = prefix;
-    std::transform(lower_str.begin(), lower_str.end(), lower_str.begin(), ::tolower);
-    std::transform(lower_prefix.begin(), lower_prefix.end(), lower_prefix.begin(), ::tolower);
-    if (lower_str == lower_prefix) {
-        out_val = trim(str.substr(prefix.size()));
-        return true;
-    }
-    return false;
+static bool isTalkKeyDown() {
+#ifdef _WIN32
+    return (GetAsyncKeyState('V') & 0x8000) != 0;
+#else
+    return false; // non-Windows uses hands-free silence detection instead
+#endif
 }
 
-bool PersonaManager::loadAll(const std::string& personas_dir) {
-    fallback_.id = "fallback";
-    fallback_.character_name = "Unknown Voice";
-    fallback_.backstory = "A presence with no clear identity yet.";
-    fallback_.current_scene = "An undefined place.";
-    fallback_.tone = "quiet, ambiguous";
-    fallback_.speech_rules = "Keep responses short and cryptic.";
-    fallback_.max_response_tokens = 2048;
-    fallback_.max_chats = 40;
-    fallback_.chats_remaining = 40;
+int main(int argc, char** argv) {
+    std::string personas_dir   = argc > 1 ? argv[1] : "personas";
+    std::string game_state_dir = argc > 2 ? argv[2] : "game_state";
+    std::string whisper_model  = argc > 3 ? argv[3] : "models/ggml-small.en.bin";
+    std::string llm_model      = argc > 4 ? argv[4] : "models/llama-3.2-3b-instruct-q4_k_m.gguf";
 
-    if (!fs::exists(personas_dir)) {
-        std::cerr << "[PersonaManager] Path not found: " << personas_dir << "\n";
-        return false;
+    int n_gpu_layers = 0;
+
+    fs::create_directories(game_state_dir);
+    const std::string section_file = game_state_dir + "/current_section.txt";
+    const std::string listen_flag  = game_state_dir + "/listen.flag";
+
+    std::cout << "=== Horror Voice NPC ===\n";
+
+    PersonaManager personas;
+    if (!personas.loadAll(personas_dir)) {
+        std::cerr << "No personas loaded from " << personas_dir
+                  << " - check path exists and contains valid .txt file(s).\n";
+        return 1;
     }
 
-    auto parseTextFile = [](const fs::path& path, Persona& p) {
-        std::ifstream f(path);
-        if (!f.is_open()) return false;
+    AudioCapture audio;
+    if (!audio.init()) return 1;
 
-        p.id = path.stem().string();
-        p.character_name = "Unknown";
-        p.max_response_tokens = 2048;
-        p.max_chats = 40; // Default turn limit
-        p.chats_remaining = 40;
+    SttEngine stt;
+    if (!stt.loadModel(whisper_model)) return 1;
 
-        std::string line;
-        while (std::getline(f, line)) {
-            line = trim(line);
-            if (line.empty() || line[0] == '#') continue;
+    LlmEngine llm;
+    if (!llm.loadModel(llm_model, n_gpu_layers)) return 1;
 
-            std::string val;
-            if (startsWithIgnoreCase(line, "name:", val) || startsWithIgnoreCase(line, "character_name:", val)) {
-                p.character_name = val;
-            } else if (startsWithIgnoreCase(line, "backstory:", val)) {
-                p.backstory = val;
-            } else if (startsWithIgnoreCase(line, "situation:", val) ||
-                       startsWithIgnoreCase(line, "current_scene:", val) ||
-                       startsWithIgnoreCase(line, "current_situation:", val) ||
-                       startsWithIgnoreCase(line, "scene:", val)) {
-                p.current_scene = val;
-            } else if (startsWithIgnoreCase(line, "tone:", val)) {
-                p.tone = val;
-            } else if (startsWithIgnoreCase(line, "rules:", val) || startsWithIgnoreCase(line, "speech_rules:", val)) {
-                p.speech_rules = val;
-            } else if (startsWithIgnoreCase(line, "tokens:", val) || startsWithIgnoreCase(line, "chats:", val)) {
-                try {
-                    p.max_chats = std::stoi(val);
-                    p.chats_remaining = p.max_chats;
-                } catch (...) {
-                    p.max_chats = 40;
-                    p.chats_remaining = 40;
-                }
-            } else {
-                if (!p.backstory.empty()) p.backstory += " ";
-                p.backstory += line;
-            }
+    OutputWriter output(game_state_dir);
+
+#ifdef _WIN32
+    std::cout << "\nReady.\n"
+              << "- Create " << listen_flag << " to start the conversation.\n"
+              << "- While it exists, hold V to record voice, release V to send.\n"
+              << "- Delete " << listen_flag << " to end the conversation.\n\n";
+#else
+    std::cout << "\nReady.\n"
+              << "- Create " << listen_flag << " to start the conversation.\n"
+              << "- The app then listens hands-free: it records until you stop talking.\n"
+              << "- Delete " << listen_flag << " to end the conversation.\n\n";
+#endif
+
+    // One full player->NPC exchange: transcribe, generate, write out.
+    auto processTurn = [&](std::vector<float> samples) {
+        const Persona& persona = personas.get(sectionBuffer);
+
+        std::cout << "[Main] Transcribing audio...\n";
+        std::string player_text = stt.transcribe(samples);
+        std::cout << "[Main] Player said: \"" << player_text << "\"\n";
+        if (!player_text.empty()) output.writeLastTranscript(player_text);
+
+        if (player_text.empty()) {
+            std::cout << "[Main] Empty transcription, skipping response.\n";
+            return;
         }
-        return true;
+
+        std::string system_prompt = personas.buildSystemPrompt(persona);
+
+        // Turn-limit handling: instead of going silently mute, the character
+        // gives one final in-character line so the game never looks broken.
+        if (persona.chats_remaining <= 0) {
+            std::cout << "[Main] Turn limit reached for " << persona.character_name
+                      << " - prompting a final line.\n";
+            system_prompt += " The conversation is ending now. Give one final, "
+                             "short, in-character line and do not ask a question.";
+        } else {
+            persona.chats_remaining--;
+            std::cout << "[Main] Remaining turns for " << persona.character_name
+                      << ": " << persona.chats_remaining << " / " << persona.max_chats << "\n";
+        }
+
+        std::cout << "[Main] Generating in-character response...\n";
+        std::string response = llm.generate(system_prompt, player_text,
+                                            persona.max_response_tokens);
+        if (response.empty()) {
+            std::cout << "[Main] LLM produced nothing, nothing written.\n";
+            return;
+        }
+        std::cout << "[Main] " << persona.character_name << ": " << response << "\n";
+        output.writeResponse(response);
     };
 
-    if (fs::is_regular_file(personas_dir)) {
-        Persona p;
-        if (parseTextFile(personas_dir, p)) {
-            personas_[p.id] = p;
-            fallback_ = p;
-            std::cout << "[PersonaManager] Loaded single text-based persona: " << p.id
-                      << " (" << p.character_name << ", Tokens: " << p.max_chats << ")\n";
-            return true;
+    std::string last_section_id;
+    std::string sectionBuffer;   // shared with the processTurn lambda
+    bool session_was_active = false;
+    bool key_was_down = false;
+
+    while (true) {
+        bool session_active = fs::exists(listen_flag);
+
+        if (!session_active) {
+            if (session_was_active) {
+                std::cout << "[Main] listen.flag removed - conversation ended.\n";
+                if (key_was_down) {
+                    audio.stopRecording();
+                    key_was_down = false;
+                }
+                // NEW: wipe memory so the next conversation starts fresh
+                llm.resetHistory();
+            }
+            session_was_active = false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
         }
-        return false;
-    }
 
-    for (const auto& entry : fs::directory_iterator(personas_dir)) {
-        if (entry.path().extension() != ".txt") continue;
-
-        Persona p;
-        if (parseTextFile(entry.path(), p)) {
-            personas_[p.id] = p;
-            std::cout << "[PersonaManager] Loaded text-based persona: " << p.id
-                      << " (" << p.character_name << ", Tokens: " << p.max_chats << ")\n";
+        if (!session_was_active) {
+            std::cout << "[Main] Conversation started (listen.flag detected).\n";
+            personas.resetAllTokens();
+            llm.resetHistory(); // defensive: make sure no stale history survives
         }
+        session_was_active = true;
+
+        sectionBuffer = readFileTrimmed(section_file);
+        if (sectionBuffer.empty()) sectionBuffer = "fallback";
+        if (sectionBuffer != last_section_id) {
+            std::cout << "[Main] Active section: " << sectionBuffer << "\n";
+            last_section_id = sectionBuffer;
+        }
+
+#ifdef _WIN32
+        // ---- Push-to-talk (Windows): hold V to record ----
+        bool key_down = isTalkKeyDown();
+
+        if (key_down && !key_was_down) {
+            std::cout << "[Main] Recording... (V held)\n";
+            audio.startRecording();
+            key_was_down = true;
+        } else if (!key_down && key_was_down) {
+            std::vector<float> samples = audio.stopRecording();
+            key_was_down = false;
+
+            if (samples.empty()) {
+                std::cout << "[Main] Nothing recorded, skipping.\n";
+            } else {
+                processTurn(std::move(samples));
+            }
+        }
+#else
+        (void)key_was_down; // only used by the Windows push-to-talk path
+        // ---- Hands-free (Linux/macOS): record until the player stops talking ----
+        std::vector<float> samples = audio.recordUntilSilence(
+            /*max_record_ms*/ 15000,
+            /*silence_ms*/ 900,
+            /*silence_rms_threshold*/ 0.01f);
+
+        if (samples.empty()) {
+            std::cout << "[Main] Nothing recorded, skipping.\n";
+        } else {
+            processTurn(std::move(samples));
+        }
+#endif
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
     }
 
-    return !personas_.empty();
-}
-
-const Persona& PersonaManager::get(const std::string& id) const {
-    auto it = personas_.find(id);
-    if (it != personas_.end()) return it->second;
-    return fallback_;
-}
-
-std::string PersonaManager::buildSystemPrompt(const Persona& p) const {
-    std::string prompt;
-    prompt += "You are " + p.character_name + ", a character in a horror game. ";
-    if (!p.backstory.empty()) {
-        prompt += "Backstory: " + p.backstory + " ";
-    }
-    if (!p.current_scene.empty()) {
-        prompt += "Current situation: " + p.current_scene + " ";
-    }
-    if (!p.tone.empty()) {
-        prompt += "Tone: speak in a " + p.tone + " manner. ";
-    }
-    if (!p.speech_rules.empty()) {
-        prompt += "Rules: " + p.speech_rules + " ";
-    }
-    prompt += "Stay fully in character at all times. Never mention that you are an AI, "
-              "a language model, or a game character. Respond only with what "
-              + p.character_name + " would say out loud, with no stage directions, "
-              "no asterisks, no narration - just spoken dialogue.";
-    return prompt;
-}
-
-void PersonaManager::resetAllTokens() {
-    for (auto& pair : personas_) {
-        pair.second.chats_remaining = pair.second.max_chats;
-    }
-    fallback_.chats_remaining = fallback_.max_chats;
-    std::cout << "[PersonaManager] Reset all persona token counters back to maximum limits.\n";
+    return 0;
 }
