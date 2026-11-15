@@ -9,9 +9,10 @@ struct Persona {
     std::string current_scene;
     std::string tone;
     std::string speech_rules;
-    std::string mood;              // NEW: how the character picks its mood
+    std::string mood;              // how the character picks its mood
     int max_response_tokens = 120;
     int max_chats = 40;
+    float temperature = 0.7f;      // NEW: model temperature for this persona
     mutable int chats_remaining = 40;
 };
 

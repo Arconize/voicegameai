@@ -14,7 +14,8 @@ public:
     void resetHistory();
     std::string generate(const std::string& system_prompt,
                          const std::string& user_text,
-                         int max_tokens = 120);
+                         int max_tokens = 120,
+                         float temperature = 0.7f);
 
 private:
     std::string applyChatTemplate(const std::string& system_prompt,

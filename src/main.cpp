@@ -198,9 +198,10 @@ int main(int argc, char** argv) {
                       << persona.chats_remaining << " / " << persona.max_chats << "\n";
         }
 
-        std::cout << "[Main] Generating in-character response...\n";
-        std::string response = llm.generate(system_prompt, player_text,
-                                            persona.max_response_tokens);
+		std::cout << "[Main] Generating in-character response (temp=" << persona.temperature << ")...\n";
+		        std::string response = llm.generate(system_prompt, player_text,
+		                                            persona.max_response_tokens,
+		                                            persona.temperature);
         if (response.empty()) {
             std::cout << "[Main] LLM produced nothing.\n";
             return;

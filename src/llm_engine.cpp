@@ -98,10 +98,10 @@ std::string LlmEngine::applyChatTemplate(const std::string& system_prompt,
     p += "<|im_start|>assistant\n";
     return p;
 }
-
 std::string LlmEngine::generate(const std::string& system_prompt,
                                 const std::string& user_text,
-                                int max_tokens) {
+                                int max_tokens,
+                                float temperature) {
     if (!model_ || !ctx_) return "";
 
     auto mem = llama_get_memory(ctx_);
@@ -153,13 +153,32 @@ std::string LlmEngine::generate(const std::string& system_prompt,
     llama_sampler* sampler = llama_sampler_chain_init(sparams);
     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
     llama_sampler_chain_add(sampler, llama_sampler_init_penalties(n_vocab, 128, 1.15f, 0.0f, 0.0f));
-    llama_sampler_chain_add(sampler, llama_sampler_init_top_k(40));
-    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.9f, 1));
-    llama_sampler_chain_add(sampler, llama_sampler_init_temp(0.8f));
 
-    const uint32_t seed =
-        (uint32_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
-    llama_sampler_chain_add(sampler, llama_sampler_init_dist(seed));
+    if (temperature <= 0.0f) {
+        // Greedy sampling when temperature is 0
+        llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
+    } else {
+        llama_sampler_chain_add(sampler, llama_sampler_init_top_k(40));
+        llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.9f, 1));
+        llama_sampler_chain_add(sampler, llama_sampler_init_min_p(0.05f, 1)); // Helps small 2B models stay coherent!
+        llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
+
+        const uint32_t seed =
+            (uint32_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
+        llama_sampler_chain_add(sampler, llama_sampler_init_dist(seed));
+    }
+
+    // Stop sequences for ChatML, Llama-3, Phi/Zephyr/TypoRP, etc.
+    const char* stop_sequences[] = {
+        "<|im_",
+        "<|user|>",
+        "<|assistant|>",
+        "<|system|>",
+        "<|end|>",
+        "<|eot_id|>",
+        "\nUser:",
+        "\nPlayer:"
+    };
 
     std::string output;
     int generated = 0;
@@ -173,8 +192,138 @@ std::string LlmEngine::generate(const std::string& system_prompt,
         int n = llama_token_to_piece(vocab, new_token, buf, sizeof(buf), 0, true);
         if (n > 0) output.append(buf, n);
 
-        size_t cut = output.find("<|im_");
-        if (cut != std::string::npos) { output.resize(cut); break; }
+        // Check if any stop sequence appeared in the output
+        bool stopped = false;
+        for (const char* stop_seq : stop_sequences) {
+            size_t cut = output.find(stop_seq);
+            if (cut != std::string::npos) {
+                output.resize(cut);
+                stopped = true;
+                break;
+            }
+        }
+        if (stopped) break;
+
+        llama_batch next_batch = llama_batch_get_one(&new_token, 1);
+        if (llama_decode(ctx_, next_batch) != 0) break;
+        ++generated;
+    }
+    llama_sampler_free(sampler);
+
+    while (!output.empty() &&
+           (output.back() == '\n' || output.back() == '\r' ||
+            output.back() == ' '  || output.back() == '\t'))
+        output.pop_back();
+
+    history_.push_back({"user", user});
+    history_.push_back({"assistant", output});
+
+    return output;
+}std::string LlmEngine::generate(const std::string& system_prompt,
+                                const std::string& user_text,
+                                int max_tokens,
+                                float temperature) {
+    if (!model_ || !ctx_) return "";
+
+    auto mem = llama_get_memory(ctx_);
+    if (mem) llama_memory_clear(mem, true);
+
+    std::string user = user_text;
+    while (!user.empty() &&
+           (user.back() == '\n' || user.back() == '\r' || user.back() == ' '))
+        user.pop_back();
+    if (user.empty()) return "";
+
+    const llama_vocab* vocab = llama_model_get_vocab(model_);
+
+    auto countTokens = [&](const std::string& text) -> int {
+        int n = llama_tokenize(vocab, text.c_str(), (int)text.size(),
+                               nullptr, 0, false, true);
+        return n < 0 ? -n : n;
+    };
+
+    std::string full_prompt = applyChatTemplate(system_prompt, user);
+    const int reserve = max_tokens + 64;
+
+    while (!history_.empty() && countTokens(full_prompt) + reserve > n_ctx_) {
+        history_.erase(history_.begin());
+        full_prompt = applyChatTemplate(system_prompt, user);
+    }
+
+    std::vector<llama_token> tokens(countTokens(full_prompt) + 8);
+    int n_tokens = llama_tokenize(vocab,
+                                  full_prompt.c_str(), (int)full_prompt.size(),
+                                  tokens.data(), (int)tokens.size(),
+                                  true, true);
+    if (n_tokens < 0) {
+        tokens.resize(-n_tokens);
+        n_tokens = llama_tokenize(vocab,
+                                  full_prompt.c_str(), (int)full_prompt.size(),
+                                  tokens.data(), (int)tokens.size(),
+                                  true, true);
+    }
+    tokens.resize(n_tokens);
+
+    llama_batch batch = llama_batch_get_one(tokens.data(), (int32_t)tokens.size());
+    if (llama_decode(ctx_, batch) != 0) {
+        std::cerr << "[LlmEngine] llama_decode failed on prompt\n";
+        return "";
+    }
+
+    llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
+    llama_sampler* sampler = llama_sampler_chain_init(sparams);
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(n_vocab, 128, 1.15f, 0.0f, 0.0f));
+
+    if (temperature <= 0.0f) {
+        // Greedy sampling when temperature is 0
+        llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
+    } else {
+        llama_sampler_chain_add(sampler, llama_sampler_init_top_k(40));
+        llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.9f, 1));
+        llama_sampler_chain_add(sampler, llama_sampler_init_min_p(0.05f, 1)); // Helps small 2B models stay coherent!
+        llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
+
+        const uint32_t seed =
+            (uint32_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
+        llama_sampler_chain_add(sampler, llama_sampler_init_dist(seed));
+    }
+
+    // Stop sequences for ChatML, Llama-3, Phi/Zephyr/TypoRP, etc.
+    const char* stop_sequences[] = {
+        "<|im_",
+        "<|user|>",
+        "<|assistant|>",
+        "<|system|>",
+        "<|end|>",
+        "<|eot_id|>",
+        "\nUser:",
+        "\nPlayer:"
+    };
+
+    std::string output;
+    int generated = 0;
+    while (generated < max_tokens) {
+        llama_token new_token = llama_sampler_sample(sampler, ctx_, -1);
+        if (llama_vocab_is_eog(vocab, new_token)) break;
+
+        llama_sampler_accept(sampler, new_token);
+
+        char buf[256];
+        int n = llama_token_to_piece(vocab, new_token, buf, sizeof(buf), 0, true);
+        if (n > 0) output.append(buf, n);
+
+        // Check if any stop sequence appeared in the output
+        bool stopped = false;
+        for (const char* stop_seq : stop_sequences) {
+            size_t cut = output.find(stop_seq);
+            if (cut != std::string::npos) {
+                output.resize(cut);
+                stopped = true;
+                break;
+            }
+        }
+        if (stopped) break;
 
         llama_batch next_batch = llama_batch_get_one(&new_token, 1);
         if (llama_decode(ctx_, next_batch) != 0) break;
