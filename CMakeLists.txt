@@ -58,13 +58,16 @@ FetchContent_MakeAvailable(whisper_cpp)
 # Main executable
 # ---------------------------------------------------------------------------
 add_executable(horror_voice_npc
-  src/main.cpp
-  src/audio_capture.cpp
-  src/persona_manager.cpp
-  src/stt_engine.cpp
-  src/llm_engine.cpp
-  src/output_writer.cpp
+    src/main.cpp
+    src/bootstrapper.cpp
+    src/persona_manager.cpp
+    src/llm_engine.cpp
+    src/stt_engine.cpp
+    src/audio_capture.cpp
+    src/output_writer.cpp
 )
+
+add_executable(packer tools/packer.cpp)
 
 target_include_directories(horror_voice_npc PRIVATE
   ${miniaudio_SOURCE_DIR}
@@ -75,6 +78,19 @@ target_link_libraries(horror_voice_npc PRIVATE
   whisper
   llama
 )
+
+if(MSVC)
+    target_link_options(horror_voice_npc PRIVATE
+        /DELAYLOAD:whisper.dll
+        /DELAYLOAD:llama.dll
+        /DELAYLOAD:ggml.dll
+        /DELAYLOAD:ggml-base.dll
+        /DELAYLOAD:ggml-cpu.dll
+        /DELAYLOAD:parakeet.dll
+        /DELAYLOAD:miniaudio.dll
+    )
+    target_link_libraries(horror_voice_npc PRIVATE delayimp)
+endif()
 
 # miniaudio needs pthread + dl on Linux
 if(UNIX AND NOT APPLE)

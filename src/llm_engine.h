@@ -24,6 +24,5 @@ private:
     llama_context* ctx_   = nullptr;
     int            n_ctx_ = 4096;
 
-    // role, content
     std::vector<std::pair<std::string, std::string>> history_;
 };

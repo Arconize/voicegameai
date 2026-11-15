@@ -3,6 +3,7 @@
 #include "stt_engine.h"
 #include "llm_engine.h"
 #include "output_writer.h"
+#include "bootstrapper.h"
 
 #include <iostream>
 #include <fstream>
@@ -10,6 +11,10 @@
 #include <thread>
 #include <chrono>
 #include <filesystem>
+#include <vector>
+#include <string>
+#include <cctype>
+#include <cstring>
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
@@ -34,19 +39,107 @@ static bool isTalkKeyDown() {
 #ifdef _WIN32
     return (GetAsyncKeyState('V') & 0x8000) != 0;
 #else
-    return false; // non-Windows uses hands-free silence detection instead
+    return false;
 #endif
 }
 
+// ── خواندن mood از فایل پرسونا ──
+// فقط happy, sad, angry مجازن. هر چیز دیگه → happy
+static std::string readMoodFromPersona(const Persona& p) {
+    std::string m = p.mood;
+    for (auto& c : m) c = (char)std::tolower((unsigned char)c);
+
+    if (m == "happy" || m == "sad" || m == "angry") return m;
+    return "happy";
+}
+
+// ── حذف تگ‌های mood از متن LLM قبل از ذخیره ──
+static std::string stripMoodTags(const std::string& text) {
+    std::string s = text;
+
+    const char* tags[] = {
+        "[happy]", "[sad]", "[angry]",
+        "[Happy]", "[Sad]", "[Angry]",
+        "[HAPPY]", "[SAD]", "[ANGRY]"
+    };
+    for (const char* t : tags) {
+        size_t pos;
+        while ((pos = s.find(t)) != std::string::npos)
+            s.erase(pos, std::strlen(t));
+    }
+
+    // حذف فاصله‌های اضافه
+    while (s.find("  ") != std::string::npos)
+        s.replace(s.find("  "), 2, " ");
+
+    // حذف فاصله و newline از ابتدا و انتها
+    size_t a = s.find_first_not_of(" \t\n\r");
+    if (a == std::string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\n\r");
+    return s.substr(a, b - a + 1);
+}
+
+static void writeMoodResponse(const std::string& dir,
+                              const std::string& mood,
+                              const std::string& text) {
+    std::error_code ec;
+
+    // پاک کردن همه‌ی فایل‌های مرتبط از دور قبل
+    const char* moods[] = {"happy", "sad", "angry"};
+    for (const auto& entry : fs::directory_iterator(dir, ec)) {
+        if (!entry.is_regular_file()) continue;
+        auto name = entry.path().filename().string();
+
+        // last_response*.txt قبلی رو پاک کن
+        if (name.rfind("last_response", 0) == 0 &&
+            entry.path().extension() == ".txt") {
+            fs::remove(entry.path(), ec);
+            continue;
+        }
+        // فایل‌های mood قبلی رو پاک کن
+        for (const char* m : moods) {
+            if (name == m) {
+                fs::remove(entry.path(), ec);
+                break;
+            }
+        }
+    }
+
+    // متن آخرین جواب
+    std::ofstream out(dir + "/last_response.txt");
+    out << text;
+    out.close();
+
+    // فایل خالی mood
+    std::ofstream moodFile(dir + "/" + mood);
+    // (کاملاً خالی می‌مونه)
+}
+
+static void ensureDefaultFiles(const std::string& personas_dir,
+                               const std::string& game_state_dir) {
+    std::error_code ec;
+    fs::create_directories(personas_dir, ec);
+    fs::create_directories(game_state_dir, ec);
+}
+
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+#endif
+
+    if (!Bootstrapper::extractIfNeeded()) {
+        std::cerr << "[Main] Bootstrap failed.\n";
+        return 1;
+    }
+
+    // ── تعریف یک‌باره‌ی همه‌ی مسیرها ──
     std::string personas_dir   = argc > 1 ? argv[1] : "personas";
     std::string game_state_dir = argc > 2 ? argv[2] : "game_state";
     std::string whisper_model  = argc > 3 ? argv[3] : "models/ggml-small.en.bin";
-    std::string llm_model      = argc > 4 ? argv[4] : "models/llama-3.2-3b-instruct-q4_k_m.gguf";
+    std::string llm_model      = argc > 4 ? argv[4] : "models/TypoRPV3-2B.Q4_K_M.gguf";
 
-    int n_gpu_layers = 0;
+    ensureDefaultFiles(personas_dir, game_state_dir);
 
-    fs::create_directories(game_state_dir);
     const std::string section_file = game_state_dir + "/current_section.txt";
     const std::string listen_flag  = game_state_dir + "/listen.flag";
 
@@ -54,8 +147,7 @@ int main(int argc, char** argv) {
 
     PersonaManager personas;
     if (!personas.loadAll(personas_dir)) {
-        std::cerr << "No personas loaded from " << personas_dir
-                  << " - check path exists and contains valid .txt file(s).\n";
+        std::cerr << "No personas loaded from " << personas_dir << "\n";
         return 1;
     }
 
@@ -66,25 +158,24 @@ int main(int argc, char** argv) {
     if (!stt.loadModel(whisper_model)) return 1;
 
     LlmEngine llm;
-    if (!llm.loadModel(llm_model, n_gpu_layers)) return 1;
+    if (!llm.loadModel(llm_model, 4096, 4)) return 1;
 
     OutputWriter output(game_state_dir);
 
 #ifdef _WIN32
     std::cout << "\nReady.\n"
-              << "- Create " << listen_flag << " to start the conversation.\n"
-              << "- While it exists, hold V to record voice, release V to send.\n"
-              << "- Delete " << listen_flag << " to end the conversation.\n\n";
+              << "- Create " << listen_flag << " to start.\n"
+              << "- Hold V to record, release V to send.\n"
+              << "- Delete " << listen_flag << " to end.\n\n";
 #else
     std::cout << "\nReady.\n"
-              << "- Create " << listen_flag << " to start the conversation.\n"
-              << "- The app then listens hands-free: it records until you stop talking.\n"
-              << "- Delete " << listen_flag << " to end the conversation.\n\n";
+              << "- Create " << listen_flag << " to start.\n"
+              << "- Hands-free recording until you stop talking.\n"
+              << "- Delete " << listen_flag << " to end.\n\n";
 #endif
 
-    // One full player->NPC exchange: transcribe, generate, write out.
-    auto processTurn = [&](std::vector<float> samples) {
-        const Persona& persona = personas.get(sectionBuffer);
+    auto processTurn = [&](std::vector<float> samples, const std::string& section_id) {
+        Persona& persona = personas.get(section_id);
 
         std::cout << "[Main] Transcribing audio...\n";
         std::string player_text = stt.transcribe(samples);
@@ -98,32 +189,36 @@ int main(int argc, char** argv) {
 
         std::string system_prompt = personas.buildSystemPrompt(persona);
 
-        // Turn-limit handling: instead of going silently mute, the character
-        // gives one final in-character line so the game never looks broken.
         if (persona.chats_remaining <= 0) {
-            std::cout << "[Main] Turn limit reached for " << persona.character_name
-                      << " - prompting a final line.\n";
-            system_prompt += " The conversation is ending now. Give one final, "
-                             "short, in-character line and do not ask a question.";
+            std::cout << "[Main] Turn limit reached - prompting final line.\n";
+            system_prompt += "\nThe conversation is ending. One final short line.";
         } else {
             persona.chats_remaining--;
-            std::cout << "[Main] Remaining turns for " << persona.character_name
-                      << ": " << persona.chats_remaining << " / " << persona.max_chats << "\n";
+            std::cout << "[Main] Remaining turns: "
+                      << persona.chats_remaining << " / " << persona.max_chats << "\n";
         }
 
         std::cout << "[Main] Generating in-character response...\n";
         std::string response = llm.generate(system_prompt, player_text,
                                             persona.max_response_tokens);
         if (response.empty()) {
-            std::cout << "[Main] LLM produced nothing, nothing written.\n";
+            std::cout << "[Main] LLM produced nothing.\n";
             return;
         }
-        std::cout << "[Main] " << persona.character_name << ": " << response << "\n";
-        output.writeResponse(response);
+
+        // mood از فایل پرسونا خونده میشه
+        std::string mood = readMoodFromPersona(persona);
+
+        // تگ‌های [happy]/[sad]/[angry] رو از متن LLM پاک کن
+        std::string clean = stripMoodTags(response);
+
+        std::cout << "[Main] " << persona.id
+                  << " [" << mood << "]: " << clean << "\n";
+        writeMoodResponse(game_state_dir, mood, clean);
     };
 
     std::string last_section_id;
-    std::string sectionBuffer;   // shared with the processTurn lambda
+    std::string sectionBuffer;
     bool session_was_active = false;
     bool key_was_down = false;
 
@@ -132,12 +227,8 @@ int main(int argc, char** argv) {
 
         if (!session_active) {
             if (session_was_active) {
-                std::cout << "[Main] listen.flag removed - conversation ended.\n";
-                if (key_was_down) {
-                    audio.stopRecording();
-                    key_was_down = false;
-                }
-                // NEW: wipe memory so the next conversation starts fresh
+                std::cout << "[Main] Conversation ended.\n";
+                if (key_was_down) { audio.stopRecording(); key_was_down = false; }
                 llm.resetHistory();
             }
             session_was_active = false;
@@ -146,9 +237,9 @@ int main(int argc, char** argv) {
         }
 
         if (!session_was_active) {
-            std::cout << "[Main] Conversation started (listen.flag detected).\n";
+            std::cout << "[Main] Conversation started.\n";
             personas.resetAllTokens();
-            llm.resetHistory(); // defensive: make sure no stale history survives
+            llm.resetHistory();
         }
         session_was_active = true;
 
@@ -160,36 +251,22 @@ int main(int argc, char** argv) {
         }
 
 #ifdef _WIN32
-        // ---- Push-to-talk (Windows): hold V to record ----
         bool key_down = isTalkKeyDown();
-
         if (key_down && !key_was_down) {
-            std::cout << "[Main] Recording... (V held)\n";
+            std::cout << "[Main] Recording...\n";
             audio.startRecording();
             key_was_down = true;
         } else if (!key_down && key_was_down) {
             std::vector<float> samples = audio.stopRecording();
             key_was_down = false;
-
-            if (samples.empty()) {
-                std::cout << "[Main] Nothing recorded, skipping.\n";
-            } else {
-                processTurn(std::move(samples));
-            }
+            if (samples.empty()) std::cout << "[Main] Nothing recorded.\n";
+            else processTurn(std::move(samples), sectionBuffer);
         }
 #else
-        (void)key_was_down; // only used by the Windows push-to-talk path
-        // ---- Hands-free (Linux/macOS): record until the player stops talking ----
-        std::vector<float> samples = audio.recordUntilSilence(
-            /*max_record_ms*/ 15000,
-            /*silence_ms*/ 900,
-            /*silence_rms_threshold*/ 0.01f);
-
-        if (samples.empty()) {
-            std::cout << "[Main] Nothing recorded, skipping.\n";
-        } else {
-            processTurn(std::move(samples));
-        }
+        (void)key_was_down;
+        std::vector<float> samples = audio.recordUntilSilence(15000, 900, 0.01f);
+        if (samples.empty()) std::cout << "[Main] Nothing recorded.\n";
+        else processTurn(std::move(samples), sectionBuffer);
 #endif
 
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
